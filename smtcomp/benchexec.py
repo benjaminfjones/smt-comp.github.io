@@ -140,19 +140,21 @@ def generate_xml(config: defs.Config, cmdtasks: List[CmdTask], file: Path, tool_
     file.write_text(indent(doc.getvalue()))
 
 
-def cmdtask_for_submission(s: defs.Submission, cachedir: Path, target_track: defs.Track, target_division: defs.Division) -> List[CmdTask]:
+def cmdtask_for_submission(
+    s: defs.Submission, cachedir: Path, target_track: defs.Track, target_division: defs.Division
+) -> List[CmdTask]:
     res: List[CmdTask] = []
-    i = -1
-    for p in s.participations.root:
+    for i, p in enumerate(s.participations.root):
         command = cast(defs.Command, p.command if p.command else s.command)
         archive = cast(defs.Archive, p.archive if p.archive else s.archive)
         for track, divisions in p.get().items():
             if track != target_track:
                 continue
 
-            i = i + 1
             suffix = get_suffix(track)
-            taskdirs: list[str] = [f"../benchmarks/files{suffix}/{logic}" for logic in divisions.get(target_division, [])]
+            taskdirs: list[str] = [
+                f"../benchmarks/files{suffix}/{logic}" for logic in divisions.get(target_division, [])
+            ]
 
             if taskdirs:
                 if command.compa_starexec:
@@ -191,9 +193,6 @@ def generate(s: defs.Submission, cachedir: Path, config: defs.Config) -> None:
     run_defs.mkdir(parents=True, exist_ok=True)
 
     for target_track, divisions in defs.tracks.items():
-        if target_track in (defs.Track.Cloud, defs.Track.Parallel):
-            continue
-
         for division in divisions.keys():
             res = cmdtask_for_submission(s, cachedir, target_track, division)
             if res:

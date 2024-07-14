@@ -159,7 +159,6 @@ The benchexec tasks generated using:
 smtcomp generate-benchexec submissions/*.json ../tmp/execution
 ```
 
-
 Benchexec started using:
 
 ```

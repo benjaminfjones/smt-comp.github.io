@@ -19,6 +19,8 @@ import smtcomp.archive as archive
 import smtcomp.benchexec as benchexec
 import smtcomp.benchexec
 import smtcomp.defs as defs
+import smtcomp.results
+import smtcomp.scoring
 import smtcomp.submission as submission
 import smtcomp.execution as execution
 import smtcomp.model_validation as model_validation
@@ -47,6 +49,7 @@ benchexec_panel = "Benchexec"
 data_panel = "Data"
 benchmarks_panel = "Benchmarks"
 selection_panel = "Selection process"
+scoring_panel = "Scoring process"
 
 
 @app.command(rich_help_panel=submissions_panel)
@@ -179,6 +182,302 @@ def generate_benchexec(
 
 
 @app.command(rich_help_panel=benchexec_panel)
+def convert_benchexec_results(
+    results: Path,
+) -> None:
+    """
+    Load benchexec results and aggregates results in feather format
+    """
+
+    lf = smtcomp.results.parse_dir(results)
+    lf.collect().write_ipc(results / "parsed.feather")
+
+
+@app.command(rich_help_panel=benchexec_panel)
+def store_results(
+    data: Path,
+    lresults: List[Path],
+) -> None:
+    """
+    Load benchexec results in feather formats and store them in data for adding them to git
+    """
+
+    config = defs.Config(data)
+    lf = pl.concat(pl.read_ipc(results / "parsed.feather").lazy() for results in lresults)
+    benchmarks = pl.read_ipc(config.cached_non_incremental_benchmarks).lazy()
+    benchmarks_inc = pl.read_ipc(config.cached_incremental_benchmarks).lazy()
+    for track, dst in config.current_results.items():
+        match track:
+            case defs.Track.Incremental:
+                b = benchmarks_inc
+                incremental = True
+            case _:
+                b = benchmarks
+                incremental = False
+        df = add_columns(
+            lf.filter(track=int(track)).drop("logic"),
+            b.select("file", "logic", "family", "name"),
+            on=["file"],
+            defaults={"logic": -1, "family": "", "name": ""},
+        ).collect()
+        if len(df) > 0:
+            results_track = defs.Results(
+                results=[
+                    defs.Result(
+                        track=track,
+                        solver=d["solver"],
+                        file=defs.Smt2File.of_tuple(
+                            incremental=incremental,
+                            logic=defs.Logic.of_int(d["logic"]),
+                            family=d["family"],
+                            name=d["name"],
+                        ),
+                        result=defs.Answer.of_int(d["answer"]),
+                        cpu_time=d["cputime_s"],
+                        wallclock_time=d["walltime_s"],
+                        memory_usage=d["memory_B"],
+                    )
+                    for d in df.to_dicts()
+                ]
+            )
+            write_cin(dst, results_track.model_dump_json(indent=1))
+
+
+@app.command(rich_help_panel=benchexec_panel)
+def stats_of_benchexec_results(
+    data: Path, results: Path, only_started: bool = False, track: defs.Track = defs.Track.SingleQuery
+) -> None:
+    """
+    Load benchexec results and print some results about them
+    """
+    config = defs.Config(data)
+
+    selected = smtcomp.results.helper_get_results(config, results, track)
+
+    sum_answer = (pl.col("answer") == -1).sum()
+    waiting = (pl.col("answer") == -1).all()
+
+    if only_started:
+        selected = selected.filter(waiting.over("logic").not_())
+
+    df = (
+        selected.group_by("division", "logic")
+        .agg(
+            n=pl.len(),
+            done=pl.len() - sum_answer,
+            sum_missing=sum_answer,
+            missing=pl.struct(sum=sum_answer, waiting=waiting),
+            solver=pl.col("solver").filter((pl.col("answer") == -1)).value_counts(),
+        )
+        .sort("division", "logic")
+        .collect()
+    )
+
+    def print_solver(d: List[Dict[str, Any]]) -> str:
+        return ",".join(map(lambda x: "{}({})".format(x["solver"], x["count"]), d))
+
+    def print_missing(d: Dict[str, Any]) -> str:
+        if d["waiting"]:
+            return "[bold red]{}[/bold red]".format(d["sum"])
+        elif d["sum"] == 0:
+            return "[bold green]{}[/bold green]".format(d["sum"])
+        else:
+            return "[bold orange1]{}[/bold orange1]".format(d["sum"])
+
+    rich_print_pl(
+        "Results",
+        df,
+        Col(
+            "division",
+            "Division",
+            footer="Total",
+            justify="left",
+            style="cyan",
+            no_wrap=True,
+            custom=defs.Division.name_of_int,
+        ),
+        Col(
+            "logic",
+            "Logic",
+            footer="",
+            justify="left",
+            style="cyan",
+            no_wrap=True,
+            custom=defs.Logic.name_of_int,
+        ),
+        Col("n", "Selected"),
+        Col("done", "Done"),
+        Col("missing", "Missing", custom=print_missing, footer=(lambda df: str(df["sum_missing"].sum()))),
+        Col("solver", "Missing", footer="", custom=print_solver),
+    )
+
+
+slash = pl.lit("/")
+path_of_logic_family_name = pl.concat_str(
+    pl.col("logic").first().map_elements(defs.Logic.name_of_int, return_dtype=pl.String),
+    slash,
+    pl.col("family").first(),
+    slash,
+    pl.col("name").first(),
+)
+
+
+@app.command(rich_help_panel=benchexec_panel)
+def find_disagreement_results(
+    data: Path, results: Path, use_previous_year_results: bool = defs.Config.use_previous_results_for_status
+) -> None:
+    """
+    Load benchexec results and print some results about them
+    """
+    config = defs.Config(data)
+    config.use_previous_results_for_status = use_previous_year_results
+    selected = smtcomp.results.helper_get_results(config, results)
+
+    df = (
+        selected.filter(pl.col("answer").is_in([int(defs.Answer.Sat), int(defs.Answer.Unsat)]))
+        .filter(
+            (
+                ((pl.col("answer") == int(defs.Answer.Sat)).any().over("file"))
+                | (pl.col("status") == int(defs.Status.Sat))
+            )
+            & (
+                ((pl.col("answer") == int(defs.Answer.Unsat)).any().over("file"))
+                | (pl.col("status") == int(defs.Status.Unsat))
+            )
+        )
+        .group_by("track", "logic", "file")
+        .agg(answers=pl.struct("solver", "answer"), status=pl.col("status").first(), name=path_of_logic_family_name)
+        .sort("track", "logic", "file")
+        .collect()
+    )
+
+    def print_answers(d: List[Dict[str, Any]]) -> str:
+        return ",".join(map(lambda x: "{}({})".format(x["solver"], defs.Answer.name_of_int(x["answer"])), d))
+
+    rich_print_pl(
+        "Disagreements",
+        df,
+        Col(
+            "name",
+            "Name",
+            footer=lambda df: str(len(df)),
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+            custom=str,
+        ),
+        Col(
+            "status",
+            "Expected",
+            footer="",
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+            custom=defs.Status.name_of_int,
+        ),
+        Col("answers", "Disagreement", custom=print_answers, footer=""),
+    )
+
+
+@app.command(rich_help_panel=scoring_panel)
+def scoring_removed_benchmarks(
+    data: Path, src: Path, use_previous_year_results: bool = defs.Config.use_previous_results_for_status
+) -> None:
+    config = defs.Config(data)
+    config.use_previous_results_for_status = use_previous_year_results
+    results = smtcomp.results.helper_get_results(config, src)
+
+    results = smtcomp.scoring.add_disagreements_info(results)
+
+    df = results.filter(disagreements=True).group_by("track", "file").agg(name=path_of_logic_family_name).collect()
+
+    rich_print_pl(
+        "Removed results (disagrements)",
+        df,
+        Col(
+            "name",
+            "Name",
+            footer=lambda df: str(len(df)),
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+            custom=str,
+        ),
+    )
+
+
+@app.command(rich_help_panel=scoring_panel)
+def show_scores(data: Path, src: Path, kind: smtcomp.scoring.Kind = typer.Argument(default="par")) -> None:
+    config = defs.Config(data)
+    results = smtcomp.results.helper_get_results(config, src)
+
+    smtcomp.scoring.sanity_check(config, results)
+
+    results = smtcomp.scoring.add_disagreements_info(results).filter(disagreements=False).drop("disagreements")
+
+    results = smtcomp.scoring.benchmark_scoring(results)
+
+    results = smtcomp.scoring.filter_for(kind, config, results)
+
+    divisions = smtcomp.scoring.division_score(results)
+
+    divisions = divisions.sort(
+        "division", *smtcomp.scoring.scores, descending=[False] + [True] * len(smtcomp.scoring.scores)
+    )
+
+    rich_print_pl(
+        "Scores",
+        divisions.collect(),
+        Col(
+            "division",
+            "divisions",
+            footer="",
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+            custom=defs.Division.name_of_int,
+        ),
+        Col(
+            "solver",
+            "Name",
+            footer="",
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+            custom=str,
+        ),
+        Col(
+            "error_score",
+            "Error Score",
+            justify="left",
+            style="red",
+            no_wrap=False,
+        ),
+        Col(
+            "correctly_solved_score",
+            "Correct Score",
+            justify="left",
+            style="green",
+            no_wrap=False,
+        ),
+        Col(
+            "wallclock_time_score",
+            "Wallclock Score",
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+        ),
+        Col(
+            "cpu_time_score",
+            "Cpu Time Score ",
+            justify="left",
+            style="cyan",
+            no_wrap=False,
+        ),
+    )
+
+
+@app.command(rich_help_panel=benchexec_panel)
 def download_archive(files: List[Path], dst: Path) -> None:
     """
     Download and unpack
@@ -291,16 +590,17 @@ OLD_CRITERIA = Annotated[bool, typer.Option(help="Simulate previous year criteri
 
 
 @app.command(rich_help_panel=selection_panel)
-def show_sq_selection_stats(
+def show_selection_stats(
     data: Path,
     old_criteria: OLD_CRITERIA = False,
     min_use_benchmarks: int = defs.Config.min_used_benchmarks,
     ratio_of_used_benchmarks: float = defs.Config.ratio_of_used_benchmarks,
     invert_triviality: bool = False,
     use_previous_results_for_status: bool = defs.Config.use_previous_results_for_status,
+    track: defs.Track = defs.Track.SingleQuery,
 ) -> None:
     """
-    Show statistics on the benchmarks selected for single query track
+    Show statistics on the benchmarks selected
 
     Logics that are not in any division are printed in red.
 
@@ -312,24 +612,9 @@ def show_sq_selection_stats(
     config.invert_triviality = invert_triviality
     config.old_criteria = old_criteria
     config.use_previous_results_for_status = use_previous_results_for_status
-    benchmarks_with_info = smtcomp.selection.helper_compute_sq(config)
-    b3 = (
-        benchmarks_with_info.group_by(["logic"])
-        .agg(
-            trivial=pl.col("file").filter(trivial=True).len(),
-            not_trivial=pl.col("file").filter(trivial=False, run=True).len(),
-            old_never_ran=pl.col("file").filter(run=False, new=False).len(),
-            new=pl.col("new").sum(),
-            selected=pl.col("file").filter(selected=True).len(),
-            selected_sat=pl.col("file").filter(selected=True, status=int(defs.Status.Sat)).len(),
-            selected_unsat=pl.col("file").filter(selected=True, status=int(defs.Status.Unsat)).len(),
-            selected_already_run=pl.col("file").filter(selected=True, run=True).len(),
-        )
-        .sort(by="logic")
-        .collect()
-    )
+    benchmarks_with_info = smtcomp.selection.helper(config, track)
 
-    used_logics = defs.logic_used_for_track(defs.Track.SingleQuery)
+    used_logics = defs.logic_used_for_track(track)
 
     def print_logic(id: int) -> str:
         logic = defs.Logic.of_int(id)
@@ -338,19 +623,62 @@ def show_sq_selection_stats(
         else:
             return f"[bold red]{str(logic)}[/bold red]"
 
-    rich_print_pl(
-        "Statistics on the benchmark selection for single query",
-        b3,
-        Col("logic", "Logic", footer="Total", justify="left", style="cyan", no_wrap=True, custom=print_logic),
-        Col("trivial", "trivial", justify="right", style="green"),
-        Col("not_trivial", "not trivial", justify="right", style="orange_red1"),
-        Col("old_never_ran", "never compet.", justify="right", style="magenta"),
-        Col("new", "new", justify="right", style="magenta1"),
-        Col("selected", "selected", justify="right", style="green3"),
-        Col("selected_sat", "selected sat", justify="right", style="green4"),
-        Col("selected_unsat", "selected unsat", justify="right", style="green4"),
-        Col("selected_already_run", "selected already run", justify="right", style="green4"),
-    )
+    if track == defs.Track.Incremental:
+        b3 = (
+            benchmarks_with_info.group_by(["logic"])
+            .agg(
+                trivial=pl.col("file").filter(trivial=True).len(),
+                not_trivial=pl.col("file").filter(trivial=False, run=True).len(),
+                old_never_ran=pl.col("file").filter(run=False, new=False).len(),
+                new=pl.col("new").sum(),
+                selected=pl.col("file").filter(selected=True).len(),
+                selected_already_run=pl.col("file").filter(selected=True, run=True).len(),
+            )
+            .sort(by="logic")
+            .collect()
+        )
+
+        rich_print_pl(
+            f"Statistics on the benchmark selection for {track!s}",
+            b3,
+            Col("logic", "Logic", footer="Total", justify="left", style="cyan", no_wrap=True, custom=print_logic),
+            Col("trivial", "trivial", justify="right", style="green"),
+            Col("not_trivial", "not trivial", justify="right", style="orange_red1"),
+            Col("old_never_ran", "never compet.", justify="right", style="magenta"),
+            Col("new", "new", justify="right", style="magenta1"),
+            Col("selected", "selected", justify="right", style="green3"),
+            Col("selected_already_run", "selected already run", justify="right", style="green4"),
+        )
+    else:
+        b3 = (
+            benchmarks_with_info.group_by(["logic"])
+            .agg(
+                trivial=pl.col("file").filter(trivial=True).len(),
+                not_trivial=pl.col("file").filter(trivial=False, run=True).len(),
+                old_never_ran=pl.col("file").filter(run=False, new=False).len(),
+                new=pl.col("new").sum(),
+                selected=pl.col("file").filter(selected=True).len(),
+                selected_sat=pl.col("file").filter(selected=True, status=int(defs.Status.Sat)).len(),
+                selected_unsat=pl.col("file").filter(selected=True, status=int(defs.Status.Unsat)).len(),
+                selected_already_run=pl.col("file").filter(selected=True, run=True).len(),
+            )
+            .sort(by="logic")
+            .collect()
+        )
+
+        rich_print_pl(
+            f"Statistics on the benchmark selection for {track!s}",
+            b3,
+            Col("logic", "Logic", footer="Total", justify="left", style="cyan", no_wrap=True, custom=print_logic),
+            Col("trivial", "trivial", justify="right", style="green"),
+            Col("not_trivial", "not trivial", justify="right", style="orange_red1"),
+            Col("old_never_ran", "never compet.", justify="right", style="magenta"),
+            Col("new", "new", justify="right", style="magenta1"),
+            Col("selected", "selected", justify="right", style="green3"),
+            Col("selected_sat", "selected sat", justify="right", style="green4"),
+            Col("selected_unsat", "selected unsat", justify="right", style="green4"),
+            Col("selected_already_run", "selected already run", justify="right", style="green4"),
+        )
 
 
 @app.command(rich_help_panel=selection_panel)
@@ -448,7 +776,7 @@ def print_iterable(i: int, tree: Tree, a: Any) -> None:
 
 
 @app.command(rich_help_panel=data_panel)
-def create_cache(data: Path) -> None:
+def create_cache(data: Path, only_current: bool = False) -> None:
     config = defs.Config(data)
     print("Loading benchmarks")
     bench = defs.Benchmarks.model_validate_json(read_cin(config.benchmarks))
@@ -459,38 +787,39 @@ def create_cache(data: Path) -> None:
         assert smtfile not in bd
         bd[smtfile] = i
 
-    print("Creating non-incremental benchmarks cache as feather file")
-    bench_simplified = map(
-        lambda x: {
-            "file": bd[x.file],
-            "logic": int(x.file.logic),
-            "family": str(x.file.family_path()),
-            "name": x.file.name,
-            "status": int(x.status),
-            "asserts": x.asserts,
-        },
-        bench.non_incremental,
-    )
-    df = pl.DataFrame(bench_simplified)
-    # df["family"] = df["family"].astype("string")
-    # df["name"] = df["name"].astype("string")
-    df.write_ipc(config.cached_non_incremental_benchmarks)
+    if not only_current:
+        print("Creating non-incremental benchmarks cache as feather file")
+        bench_simplified = map(
+            lambda x: {
+                "file": bd[x.file],
+                "logic": int(x.file.logic),
+                "family": str(x.file.family_path()),
+                "name": x.file.name,
+                "status": int(x.status),
+                "asserts": x.asserts,
+            },
+            bench.non_incremental,
+        )
+        df = pl.DataFrame(bench_simplified)
+        # df["family"] = df["family"].astype("string")
+        # df["name"] = df["name"].astype("string")
+        df.write_ipc(config.cached_non_incremental_benchmarks)
 
-    print("Creating incremental benchmarks cache as feather file")
-    bench_simplified = map(
-        lambda x: {
-            "file": bd[x.file],
-            "logic": int(x.file.logic),
-            "family": str(x.file.family_path()),
-            "name": x.file.name,
-            "check_sats": x.check_sats,
-        },
-        bench.incremental,
-    )
-    df = pl.DataFrame(bench_simplified)
-    # df["family"] = df["family"].astype("string")
-    # df["name"] = df["name"].astype("string")
-    df.write_ipc(config.cached_incremental_benchmarks)
+        print("Creating incremental benchmarks cache as feather file")
+        bench_simplified = map(
+            lambda x: {
+                "file": bd[x.file],
+                "logic": int(x.file.logic),
+                "family": str(x.file.family_path()),
+                "name": x.file.name,
+                "check_sats": x.check_sats,
+            },
+            bench.incremental,
+        )
+        df = pl.DataFrame(bench_simplified)
+        # df["family"] = df["family"].astype("string")
+        # df["name"] = df["name"].astype("string")
+        df.write_ipc(config.cached_incremental_benchmarks)
 
     def convert(x: defs.Result, year: int) -> dict[str, int | str | float] | None:
         if x.file not in bd:
@@ -506,15 +835,25 @@ def create_cache(data: Path) -> None:
             "year": year,
         }
 
-    results_filtered: list[Any] = []
-    for year, file in track(config.previous_results, description="Loading json results"):
-        results = defs.Results.model_validate_json(read_cin(file))
-        results_filtered.extend(filter(lambda x: x is not None, map(lambda r: convert(r, year), results.results)))
+    if not only_current:
+        results_filtered: list[Any] = []
+        for year, file in track(config.previous_results, description="Loading json results"):
+            results = defs.Results.model_validate_json(read_cin(file))
+            results_filtered.extend(filter(lambda x: x is not None, map(lambda r: convert(r, year), results.results)))
 
-    print("Creating old results cache as feather file")
-    df = pl.DataFrame(results_filtered)
-    # df["solver"] = df["solver"].astype("string")
-    df.write_ipc(config.cached_previous_results)
+        print("Creating old results cached as feather file")
+        df = pl.DataFrame(results_filtered)
+        # df["solver"] = df["solver"].astype("string")
+        df.write_ipc(config.cached_previous_results)
+
+    for tra, file in config.current_results.items():
+        if file.exists():
+            print(f"Creating current results for {tra!s} cached as feather file")
+            results = defs.Results.model_validate_json(read_cin(file))
+            df = pl.DataFrame(
+                filter(lambda x: x is not None, map(lambda r: convert(r, config.current_year), results.results))
+            )
+            df.write_ipc(config.cached_current_results[tra])
 
 
 @app.command(rich_help_panel=benchexec_panel)
@@ -625,7 +964,8 @@ def check_model_locally(
         t2 = t.add(solver)
         for rid, r, result in rs:
             stderr = result.stderr.strip().replace("\n", ", ")
-            t2.add(f"{r.basename}: {stderr}")
+            basename = smtcomp.scramble_benchmarks.scramble_basename(r.scramble_id)
+            t2.add(f"{basename}: {stderr}")
     print(t)
     if outdir is not None:
         for solver, models in d:
@@ -633,10 +973,9 @@ def check_model_locally(
             dst.mkdir(parents=True, exist_ok=True)
             for rid, r, result in models:
                 filedir = benchmark_files_dir(cachedir, rid.track)
-                logic = rid.includefile.removesuffix(get_suffix(rid.track))
-                basename = r.basename.removesuffix(".yml") + ".smt2"
-                basename_model = r.basename.removesuffix(".yml") + ".rsmt2"
-                smt2_file = filedir / logic / basename
+                basename = smtcomp.scramble_benchmarks.scramble_basename(r.scramble_id)
+                basename_model = smtcomp.scramble_benchmarks.scramble_basename(r.scramble_id, suffix="rsmt2")
+                smt2_file = filedir / str(r.logic) / basename
                 (dst / basename).unlink(missing_ok=True)
                 (dst / basename).symlink_to(smt2_file)
                 (dst / basename_model).write_text(result.model)

@@ -5,7 +5,7 @@ import hashlib
 import re
 from enum import Enum
 from pathlib import Path, PurePath
-from typing import Any, Dict, cast, Optional, Iterable, TypeVar
+from typing import Any, Dict, cast, Optional, Iterable, TypeVar, Self, ClassVar
 
 from pydantic import BaseModel, Field, RootModel, model_validator, ConfigDict
 from pydantic.networks import HttpUrl, validate_email
@@ -20,16 +20,18 @@ class EnumAutoInt(Enum):
     Normal enum with strings, but each enum is associated to an int
     """
 
+    __ordered__: ClassVar[list[Self]]
+
     def __str__(self) -> str:
         return str(self.value)
 
-    def __new__(cls, id: str) -> EnumAutoInt:
-        obj = object.__new__(cls)
+    def __new__(cls, id: str) -> Self:
+        obj: Self = object.__new__(cls)
         obj._value_ = id
         value = len(cls.__members__)
         obj.id = value
         if "__ordered__" not in cls.__dict__:
-            cls.__ordered__: list[EnumAutoInt] = []
+            cls.__ordered__: list[Self] = []
         cls.__ordered__.append(obj)
         return obj
 
@@ -40,8 +42,8 @@ class EnumAutoInt(Enum):
         return self.id
 
     @classmethod
-    def of_int(cls, id: int) -> EnumAutoInt:
-        return cls.__ordered__[id]
+    def of_int(cls, id: int) -> Self:
+        return cast(Self, cls.__ordered__[id])
 
     @classmethod
     def name_of_int(cls, id: int) -> str:
@@ -145,6 +147,15 @@ class Status(EnumAutoInt):
     Incremental = "incremental"
 
 
+class Answer(EnumAutoInt):
+    Unsat = "unsat"
+    Sat = "sat"
+    Unknown = "unknown"
+    Incremental = "incremental"
+    OOM = "OutOfMemory"
+    Timeout = "Timeout"
+
+
 class Track(EnumAutoInt):
     UnsatCore = "UnsatCore"
     SingleQuery = "SingleQuery"
@@ -153,6 +164,23 @@ class Track(EnumAutoInt):
     Incremental = "Incremental"
     Cloud = "Cloud"
     Parallel = "Parallel"
+
+    def short_cut(self: Track) -> str:
+        match self:
+            case Track.UnsatCore:
+                return "uc"
+            case Track.SingleQuery:
+                return "sq"
+            case Track.ProofExhibition:
+                return "pe"
+            case Track.ModelValidation:
+                return "mv"
+            case Track.Incremental:
+                return "inc"
+            case Track.Cloud:
+                return "cloud"
+            case Track.Parallel:
+                return "parallel"
 
 
 class Division(EnumAutoInt):
@@ -421,6 +449,7 @@ tracks: dict[Track, dict[Division, set[Logic]]] = {
             Logic.QF_AUFBVLIA,
             Logic.QF_AUFBVNIA,
             Logic.QF_UFBVLIA,
+            Logic.QF_BVLRA,
         },
         Division.QF_LinearIntArith: {
             Logic.QF_LIA,
@@ -1183,6 +1212,11 @@ class Participation(BaseModel, extra="forbid"):
                         logics.add(logic)
         return d
 
+    def get_logics_by_track(self) -> dict[Track, set[Logic]]:
+        """Return the logics in which the solver participates"""
+        tracks = self.get()
+        return dict((track, union(tracks[track].values())) for track in tracks)
+
     def complete(self, archive: Archive | None, command: Command | None) -> ParticipationCompleted:
         archive = cast(Archive, archive if self.archive is None else self.archive)
         command = cast(Command, command if self.command is None else self.command)
@@ -1289,7 +1323,7 @@ class Smt2File(BaseModel):
         return Path(*self.family)
 
     @classmethod
-    def of_tuple(cls, incremental: bool, logic: Logic, family: Path, name: str) -> Smt2File:
+    def of_tuple(cls, incremental: bool, logic: Logic, family: Path | str, name: str) -> Smt2File:
         parts = PurePath(family).parts
 
         return Smt2File(
@@ -1338,7 +1372,7 @@ class Result(BaseModel):
     track: Track
     solver: str
     file: Smt2File
-    result: Status
+    result: Answer
     cpu_time: float
     wallclock_time: float
     memory_usage: float
@@ -1357,7 +1391,7 @@ class Config:
     cpuCores = 4
     min_used_benchmarks = 300
     ratio_of_used_benchmarks = 0.5
-    use_previous_results_for_status = True
+    use_previous_results_for_status = False
     """
     Complete the status given in the benchmarks using previous results
     """
@@ -1379,12 +1413,18 @@ class Config:
     """
     Number of selected benchmarks
     """
+    unsat_core_min_num_asserts = 2
+    """
+    Minimum number of assertions for unsat core
+    """
 
-    removed_benchmarks = [{
-        "logic": int(Logic.QF_LIA),
-        "family": "20210219-Dartagnan/ConcurrencySafety-Main",
-        "name": "39_rand_lock_p0_vs-O0.smt2",
-    }]
+    removed_benchmarks = [
+        {
+            "logic": int(Logic.QF_LIA),
+            "family": "20210219-Dartagnan/ConcurrencySafety-Main",
+            "name": "39_rand_lock_p0_vs-O0.smt2",
+        }
+    ]
 
     def __init__(self, data: Path | None) -> None:
         if data is not None and data.name != "data":
@@ -1403,6 +1443,18 @@ class Config:
             (year, self.data.joinpath(f"results-sq-{year}.json.gz"))
             for year in range(Config.oldest_previous_results, Config.current_year)
         ]
+
+    @functools.cached_property
+    def current_results(self) -> dict[Track, Path]:
+        return dict(
+            (track, self.data.joinpath(f"results-{track.short_cut()}-{self.current_year}.json.gz")) for track in Track
+        )
+
+    @functools.cached_property
+    def cached_current_results(self) -> dict[Track, Path]:
+        return dict(
+            (track, self.data.joinpath(f"results-{track.short_cut()}-{self.current_year}.feather")) for track in Track
+        )
 
     @functools.cached_property
     def benchmarks(self) -> Path:
