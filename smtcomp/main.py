@@ -24,6 +24,7 @@ import smtcomp.scoring
 import smtcomp.submission as submission
 import smtcomp.execution as execution
 import smtcomp.model_validation as model_validation
+import smtcomp.unsat_core_validation as unsat_core_validation
 import smtcomp.results as results
 from smtcomp.benchmarks import clone_group
 import smtcomp.convert_csv
@@ -993,6 +994,13 @@ def check_model_locally(
                 (dst / basename).unlink(missing_ok=True)
                 (dst / basename).symlink_to(smt2_file)
                 (dst / basename_model).write_text(result.model)
+
+
+@app.command()
+def generate_unsatcore_validation_files(
+    cachedir: Path, scrambler: Path, resultdirs: list[Path], max_workers: int = 8
+) -> None:
+    unsat_core_validation.generate_validation_files(cachedir, resultdirs, scrambler)
 
 
 @app.command()
